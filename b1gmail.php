@@ -1,4 +1,4 @@
-<?php 
+<?php
 /*
  * Project         : b1gMail backend for Z-Push
  * File            : b1gmail.php
@@ -7,7 +7,7 @@
  * Created         : 27.01.2013
  *
  * Copyright (C) 2013-2015 Patrick Schlangen <ps@b1g.de>
- * 
+ *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU Affero General Public License as published by
  * the Free Software Foundation, either version 3 of the License, or
@@ -23,9 +23,13 @@
  *
  */
 
+if(!class_exists('SQLite3') && class_exists('PDO') && in_array('sqlite', PDO::getAvailableDrivers()))
+	require_once('sqlite3.php');
+
 include_once('lib/default/diffbackend/diffbackend.php');
 require_once('backend/b1gmail/db.php');
 require_once('backend/b1gmail/sendmail.php');
+require_once('backend/b1gmail/blobstorage.php');
 require_once('include/mimeDecode.php');
 require_once('include/z_RFC822.php');
 
@@ -33,7 +37,7 @@ class BackendB1GMail extends BackendDiff
 {
 	private $dbHandle;
 	private $db;
-	private $prefs;
+	public $prefs;
 	private $loggedOn = false;
 	private $tccmeInstalled = false;
 	private $tccmePrivKey = false;
@@ -41,7 +45,7 @@ class BackendB1GMail extends BackendDiff
 	private $userID = 0;
 	private $userRow;
 	private $groupRow;
-	
+
 	/**
 	 * class constructor
 	 */
@@ -53,7 +57,7 @@ class BackendB1GMail extends BackendDiff
 		{
 			throw new FatalException('b1gMail backend not configured', 0, null, LOGLEVEL_FATAL);
 		}
-		
+
 		// connect to database
 		$this->dbHandle = mysql_connect(B1GMAIL_DB_HOST, B1GMAIL_DB_USER, B1GMAIL_DB_PASS);
 		if(!$this->dbHandle)
@@ -62,11 +66,11 @@ class BackendB1GMail extends BackendDiff
 			throw new FatalException('Failed to select b1gMail MySQL DB', 0, null, LOGLEVEL_FATAL);
 		$this->db = new DB($this->dbHandle);
 		$this->db->Query('SET NAMES utf8');
-		
+
 		// read preferences
 		$this->prefs = $this->GetPrefs();
 	}
-	
+
 	/**
 	 * class destructor
 	 */
@@ -76,7 +80,7 @@ class BackendB1GMail extends BackendDiff
 		if($this->dbHandle)
 			mysql_close($this->dbHandle);
 	}
-	
+
 	/**
 	 * Logon function
 	 *
@@ -97,21 +101,21 @@ class BackendB1GMail extends BackendDiff
 		}
 		$userRow = $res->FetchArray(MYSQL_ASSOC);
 		$res->Free();
-		
+
 		// locked?
 		if($userRow['gesperrt'] != 'no')
 		{
 			ZLog::Write(LOGLEVEL_ERROR, sprintf('Login as "%s" failed: user locked', $username));
 			return(false);
 		}
-		
+
 		// check password
 		if($userRow['passwort'] !== md5(md5($password) . $userRow['passwort_salt']))
 		{
 			ZLog::Write(LOGLEVEL_ERROR, sprintf('Login as "%s" failed: wrong password', $username));
 			return(false);
 		}
-		
+
 		// check group permission
 		$res = $this->db->Query('SELECT * FROM {pre}gruppen WHERE `id`=?',
 			$userRow['gruppe']);
@@ -140,7 +144,7 @@ class BackendB1GMail extends BackendDiff
 			}
 		}
 		$res->Free();
-		
+
 		// login successful
 		$this->loggedOn 	= true;
 		$this->userID 		= $userRow['id'];
@@ -155,7 +159,7 @@ class BackendB1GMail extends BackendDiff
 
 		return(true);
 	}
-	
+
 	/**
 	 * Logoff function
 	 */
@@ -170,10 +174,51 @@ class BackendB1GMail extends BackendDiff
 			$this->tccmePrivKey	= false;
 			$this->tccmeCert  	= false;
 		}
-		
+
 		$this->SaveStorages();
 	}
-	
+
+	/**
+	 * check if user is allowed to send email (check send limit)
+	 *
+	 * @param $recipientCount Number of recipients
+	 * @return bool
+	 */
+	function MaySendMail($recipientCount)
+	{
+		if($recipientCount < 1)
+			return(false);
+
+		if($this->groupRow['send_limit_count'] <= 0 || $this->groupRow['send_limit_time'] <= 0)
+			return(true);
+
+		if($recipientCount > $this->groupRow['send_limit_count'])
+			return(false);
+
+		$res = $this->db->Query('SELECT SUM(`recipients`) FROM {pre}sendstats WHERE `userid`=? AND `time`>=?',
+			$this->userID,
+			time() - 60 * $this->groupRow['send_limit_time']);
+		$row = $res->FetchArray(MYSQL_NUM);
+		$res->Free();
+
+		$count = (int)$row[0];
+
+		return($count + $recipientCount <= $this->groupRow['send_limit_count']);
+	}
+
+	/**
+	 * add email to send stats (for send limit)
+	 *
+	 * @param $recipientCount Number of recipients
+	 */
+	function AddSendStat($recipientCount)
+	{
+		$this->db->Query('INSERT INTO {pre}sendstats(`userid`,`recipients`,`time`) VALUES(?,?,?)',
+			$this->userID,
+			max(1, $recipientCount),
+			time());
+	}
+
 	/**
 	 * Send mail, save copy in outbox
 	 *
@@ -183,13 +228,6 @@ class BackendB1GMail extends BackendDiff
 	public function SendMail($sm)
 	{
 		ZLog::Write(LOGLEVEL_DEBUG, 'b1gMail::SendMail()');
-
-		// check sending frequency
-		if(($this->userRow['last_send'] + $this->groupRow['send_limit']) > time())
-		{
-			ZLog::Write(LOGLEVEL_INFO, 'SendMail(): Message rejected: Maximum sending frequency violation');
-			return(false);
-		}
 
 		// parse message
 		$mimeParser = new Mail_mimeDecode($sm->mime);
@@ -209,6 +247,13 @@ class BackendB1GMail extends BackendDiff
 			$recipientsStr .= ' ' . $parsedMail->headers['bcc'];
 		$recipients = $this->ExtractMailAddresses($recipientsStr);
 		$sender = $this->ExtractMailAddress($parsedMail->headers['from']);
+
+		// check sending frequency
+		if(!$this->MaySendMail(count($recipients)))
+		{
+			ZLog::Write(LOGLEVEL_INFO, 'SendMail(): Message rejected: Maximum sending frequency violation');
+			return(false);
+		}
 
 		// check recipient limit
 		if(count($recipients) > $this->groupRow['max_recps'])
@@ -246,6 +291,8 @@ class BackendB1GMail extends BackendDiff
 
 		if($result)
 		{
+			$this->AddSendStat(count($recipients));
+
 			// update last send
 			$this->db->Query('UPDATE {pre}users SET `last_send`=?,`sent_mails`=`sent_mails`+? WHERE `id`=?',
 				time(),
@@ -265,11 +312,11 @@ class BackendB1GMail extends BackendDiff
 				case 1:
 					$priority = 'high';
 					break;
-				
+
 				case 5:
 					$priority = 'normal';
 					break;
-					
+
 				default:
 					$priority = 'low';
 					break;
@@ -306,16 +353,15 @@ class BackendB1GMail extends BackendDiff
 			$mailSize = strlen($sm->mime);
 
 			// copy to outbox if enough free space
-			if($this->userRow['mailspace_used'] + $mailSize <= $this->groupRow['storage'])
+			if($this->userRow['mailspace_used'] + $mailSize <= $this->groupRow['storage'] + $this->userRow['mailspace_add'])
 			{
-				$this->db->Query('INSERT INTO {pre}mails(userid,betreff,von,an,cc,body,folder,datum,trashstamp,priority,fetched,msg_id,virnam,trained,refs,flags,size) VALUES '
+				$this->db->Query('INSERT INTO {pre}mails(userid,betreff,von,an,cc,folder,datum,trashstamp,priority,fetched,msg_id,virnam,trained,refs,flags,size,blobstorage) VALUES '
 					. '(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
 					$this->userID,
 					!empty($parsedMail->headers['subject']) ? $parsedMail->headers['subject'] 	: '',
 					!empty($parsedMail->headers['from']) 	? $parsedMail->headers['from'] 		: '',
 					!empty($parsedMail->headers['to']) 		? $parsedMail->headers['to'] 		: '',
 					!empty($parsedMail->headers['cc']) 		? $parsedMail->headers['cc'] 		: '',
-					'file',
 					-2,
 					$date,
 					0,
@@ -326,20 +372,26 @@ class BackendB1GMail extends BackendDiff
 					0,
 					implode(';;;', $references),
 					$mailFlags,
-					$mailSize);
+					$mailSize,
+					$this->prefs['blobstorage_provider']);
 				$mailID = $this->db->InsertId();
 
 				// create file
 				if($mailID)
 				{
-					$fn = $this->DataFilename($mailID);
-					if(@file_put_contents($fn, $sm->mime) !== false)
+					$provider = $this->CreateBlobStorageProvider($this->prefs['blobstorage_provider']);
+					if($provider)
 					{
-						@chmod($fn, 0666);
+						if(!$provider->storeBlob(BMBLOB_TYPE_MAIL, $mailID, $sm->mime))
+						{
+							ZLog::Write(LOGLEVEL_ERROR, sprintf('SendMail(): Failed to store blob %d using provider %d',
+								$mailID, $this->prefs['blobstorage_provider']));
+						}
 					}
 					else
 					{
-						ZLog::Write(LOGLEVEL_ERROR, sprintf('SendMail(): Failed to create mail file %s', $fn));
+						ZLog::Write(LOGLEVEL_ERROR, sprintf('SendMail(): Failed to create blob storage provider %d',
+							$this->prefs['blobstorage_provider']));
 					}
 				}
 				else
@@ -360,17 +412,17 @@ class BackendB1GMail extends BackendDiff
 
 		return($result);
 	}
-	
+
 	/**
 	 * Get attachment data
-	 * 
+	 *
 	 * @param string $attname Attachment name
 	 * @return SyncItemOperationsAttachment
 	 */
 	public function GetAttachmentData($attname)
 	{
 		ZLog::Write(LOGLEVEL_DEBUG, sprintf('b1gMail::GetAttachmentData(%s)', $attname));
-	
+
 		if(strpos($attname, ':') === false)
 		{
 			ZLog::Write(LOGLEVEL_INFO, 'GetAttachmentData(): Invalid attname');
@@ -381,7 +433,7 @@ class BackendB1GMail extends BackendDiff
 		list($mailID, $partID) = explode(':', $attname);
 
 		// get mail row
-		$res = $this->db->Query('SELECT `body` FROM {pre}mails WHERE `id`=? AND `userid`=?',
+		$res = $this->db->Query('SELECT `blobstorage` FROM {pre}mails WHERE `id`=? AND `userid`=?',
 			$mailID,
 			$this->userID);
 		if($res->RowCount() != 1)
@@ -391,11 +443,10 @@ class BackendB1GMail extends BackendDiff
 		}
 		$row = $res->FetchArray(MYSQL_ASSOC);
 		$res->Free();
-		
+
 		// get message
-		$mailData = $this->GetMessageData($mailID, $row['body']);
-		unset($row['body']);
-		
+		$mailData = $this->GetMessageData($mailID, $row['blobstorage']);
+
 		// parse message
 		$mimeParser = new Mail_mimeDecode($mailData);
 		$parsedMail = $mimeParser->decode(array(
@@ -426,7 +477,7 @@ class BackendB1GMail extends BackendDiff
 
 		return($att);
 	}
-	
+
 	/**
 	 * Return ID of trash folder
 	 *
@@ -447,9 +498,9 @@ class BackendB1GMail extends BackendDiff
 	public function GetFolderList()
 	{
 		ZLog::Write(LOGLEVEL_DEBUG, 'b1gMail::GetFolderList()');
-		
+
 		$result = array();
-		
+
 		// system email folders
 		$result[] = array(
 			'id'		=> '.email:0',
@@ -476,7 +527,7 @@ class BackendB1GMail extends BackendDiff
 			'parent'	=> '0',
 			'mod'		=> 'Trash'
 		);
-		
+
 		// user-created email folders
 		$res = $this->db->Query('SELECT `id`,`titel`,`parent` FROM {pre}folders WHERE `userid`=? AND `intelligent`=0 AND `subscribed`=1',
 			$this->userID);
@@ -493,7 +544,7 @@ class BackendB1GMail extends BackendDiff
 			);
 		}
 		$res->Free();
-		
+
 		// dates
 		$result[] = array(
 			'id'		=> '.dates:0',
@@ -512,14 +563,14 @@ class BackendB1GMail extends BackendDiff
 			);
 		}
 		$res->Free();
-		
+
 		// contacts
 		$result[] = array(
 			'id'		=> '.contacts',
 			'parent'	=> '0',
 			'mod'		=> 'Contacts'
 		);
-		
+
 		// tasks - main task list
 		$result[] = array(
 			'id'		=> '.tasks:0',
@@ -538,10 +589,10 @@ class BackendB1GMail extends BackendDiff
 			);
 		}
 		$res->Free();
-		
+
 		return($result);
 	}
-	
+
 	/**
 	 * Get folder details.
 	 *
@@ -551,7 +602,7 @@ class BackendB1GMail extends BackendDiff
 	public function GetFolder($id)
 	{
 		ZLog::Write(LOGLEVEL_DEBUG, sprintf('b1gMail::GetFolder(%s)', $id));
-		
+
 		// contacts folder
 		if($id == '.contacts')
 		{
@@ -562,12 +613,12 @@ class BackendB1GMail extends BackendDiff
 			$folder->type 			= SYNC_FOLDER_TYPE_CONTACT;
 			return($folder);
 		}
-		
+
 		// dates folder
 		else if(strlen($id) > 7 && substr($id, 0, 7) == '.dates:')
 		{
 			list(, $calendarID) = explode(':', $id);
-		
+
 			if($calendarID == 0)
 			{
 				$folder = new SyncFolder();
@@ -582,11 +633,11 @@ class BackendB1GMail extends BackendDiff
 				$res = $this->db->Query('SELECT `title` FROM {pre}dates_groups WHERE `user`=? AND `id`=?',
 					$this->userID,
 					$calendarID);
-				if($res->RowCount() != 1) 
+				if($res->RowCount() != 1)
 					return(false);
 				$row = $res->FetchArray(MYSQL_ASSOC);
 				$res->Free();
-				
+
 				$folder = new SyncFolder();
 				$folder->serverid 		= $id;
 				$folder->parentid 		= '.dates:0';
@@ -595,12 +646,12 @@ class BackendB1GMail extends BackendDiff
 				return($folder);
 			}
 		}
-		
+
 		// tasks folder
 		else if(strlen($id) > 7 && substr($id, 0, 7) == '.tasks:')
 		{
 			list(, $taskListID) = explode(':', $id);
-		
+
 			if($taskListID == 0)
 			{
 				$folder = new SyncFolder();
@@ -615,11 +666,11 @@ class BackendB1GMail extends BackendDiff
 				$res = $this->db->Query('SELECT `title` FROM {pre}tasklists WHERE `userid`=? AND `tasklistid`=?',
 					$this->userID,
 					$taskListID);
-				if($res->RowCount() != 1) 
+				if($res->RowCount() != 1)
 					return(false);
 				$row = $res->FetchArray(MYSQL_ASSOC);
 				$res->Free();
-				
+
 				$folder = new SyncFolder();
 				$folder->serverid 		= $id;
 				$folder->parentid 		= '.tasks:0';
@@ -628,16 +679,16 @@ class BackendB1GMail extends BackendDiff
 				return($folder);
 			}
 		}
-		
+
 		// email folder
 		else if(strlen($id) > 7 && substr($id, 0, 7) == '.email:')
 		{
 			list(, $folderID) = explode(':', $id);
-			
+
 			$folder = new SyncFolder();
 			$folder->serverid		= $id;
 			$folder->parentid		= '0';
-				
+
 			if($folderID == 0)
 			{
 				$folder->displayname	= 'Inbox';
@@ -674,7 +725,7 @@ class BackendB1GMail extends BackendDiff
 						$parentID = '0';
 					else
 						$parentID = '.email:' . $row['parent'];
-					
+
 					$folder->parentid		= $parentID;
 					$folder->displayname	= $row['titel'];
 					$folder->type			= SYNC_FOLDER_TYPE_USER_MAIL;
@@ -685,27 +736,27 @@ class BackendB1GMail extends BackendDiff
 			{
 				return(false);
 			}
-			
+
 			return($folder);
 		}
-		
+
 		return(false);
 	}
-	
+
 	/**
 	 * Get folder stats.
-	 * 
+	 *
 	 * @param string $id Folder ID
 	 * @return array
 	 */
 	public function StatFolder($id)
 	{
 		ZLog::Write(LOGLEVEL_DEBUG, sprintf('b1gMail::StatFolder(%s)', $id));
-		
+
 		$folder = $this->GetFolder($id);
 		if(!$folder)
 			return(false);
-		
+
 		$result = array(
 			'id'		=> $id,
 			'parent'	=> $folder->parentid,
@@ -713,7 +764,7 @@ class BackendB1GMail extends BackendDiff
 		);
 		return($result);
 	}
-	
+
 	/**
 	 * Change a folder.
 	 *
@@ -729,7 +780,7 @@ class BackendB1GMail extends BackendDiff
 			$oldid,
 			$displayname,
 			$type));
-			
+
 		if(strlen($folderid) > 7 && substr($folderid, 0, 7) == '.tasks:')
 			return($this->ChangeTaskList($folderid, $oldid, $displayname, $type));
 		else if(strlen($folderid) > 7 && substr($folderid, 0, 7) == '.email:')
@@ -739,7 +790,7 @@ class BackendB1GMail extends BackendDiff
 
 		return(false);
 	}
-	
+
 	/**
 	 * Internally used function to create/rename a task list.
 	 *
@@ -755,7 +806,7 @@ class BackendB1GMail extends BackendDiff
 			$oldid,
 			$displayname,
 			$type));
-		
+
 		// create new task list
 		if(empty($oldid))
 		{
@@ -764,7 +815,7 @@ class BackendB1GMail extends BackendDiff
 				$displayname);
 			$oldid = '.tasks:' . $this->db->InsertId();
 		}
-		
+
 		// rename existing task list
 		else
 		{
@@ -774,10 +825,10 @@ class BackendB1GMail extends BackendDiff
 				$this->userID,
 				$taskListID);
 		}
-		
+
 		return($this->StatFolder($oldid));
 	}
-	
+
 	/**
 	 * Internally used function to create/rename a date group.
 	 *
@@ -815,7 +866,7 @@ class BackendB1GMail extends BackendDiff
 
 		return($this->StatFolder($oldid));
 	}
-	
+
 	/**
 	 * Internally used function to create/rename an email folder.
 	 *
@@ -831,7 +882,7 @@ class BackendB1GMail extends BackendDiff
 			$oldid,
 			$displayname,
 			$type));
-		
+
 		list(, $parentFolderID) = explode(':', $folderid);
 		if($parentFolderID <= 0)
 			$parentFolderID = -1;
@@ -858,13 +909,13 @@ class BackendB1GMail extends BackendDiff
 				$this->userID,
 				$groupID);
 		}
-		
+
 		$this->IncMailboxStructureGeneration();
 		$this->IncMailboxGeneration();
-		
+
 		return($this->StatFolder($oldid));
 	}
-	
+
 	/**
 	 * Delete a folder.
 	 *
@@ -877,15 +928,15 @@ class BackendB1GMail extends BackendDiff
 		ZLog::Write(LOGLEVEL_DEBUG, sprintf('b1gMail::DeleteFolder(%s,%s)',
 			$id,
 			$parentid));
-		
+
 		if(strlen($id) > 7 && substr($id, 0, 7) == '.tasks:')
 			return($this->DeleteTaskList($id));
 		else if(strlen($id) > 7 && substr($id, 0, 7) == '.email:')
 			return($this->DeleteMailFolder($id));
-		
+
 		return(false);
 	}
-	
+
 	/**
 	 * Delete a task list.
 	 *
@@ -896,19 +947,19 @@ class BackendB1GMail extends BackendDiff
 	{
 		ZLog::Write(LOGLEVEL_DEBUG, sprintf('b1gMail::DeleteTaskList(%s)',
 			$id));
-		
+
 		list(, $taskListID) = explode(':', $id);
-		
+
 		$this->db->Query('DELETE FROM {pre}tasks WHERE `tasklistid`=? AND `user`=?',
 			$taskListID,
 			$this->userID);
 		$this->db->Query('DELETE FROM {pre}tasklists WHERE `tasklistid`=? AND `userid`=?',
 			$taskListID,
 			$this->userID);
-		
+
 		return($this->db->AffectedRows() > 0);
 	}
-	
+
 	/**
 	 * Delete a mail folder.
 	 *
@@ -919,10 +970,10 @@ class BackendB1GMail extends BackendDiff
 	{
 		ZLog::Write(LOGLEVEL_DEBUG, sprintf('b1gMail::DeleteMailFolder(%s)',
 			$id));
-		
+
 		list(, $folderID) = explode(':', $id);
 		$result = false;
-		
+
 		// delete child folders
 		$res = $this->db->Query('SELECT `id` FROM {pre}folders WHERE `parent`=? AND `userid`=?',
 			$folderID,
@@ -933,33 +984,33 @@ class BackendB1GMail extends BackendDiff
 			$this->DeleteMailFolder('.email:' . $row['id']);
 		}
 		$res->Free();
-		
+
 		// delete folder
 		$this->db->Query('DELETE FROM {pre}folders WHERE `id`=? AND `userid`=?',
 			$folderID,
 			$this->userID);
 		$result = $this->db->AffectedRows() == 1;
-		
+
 		if($result)
-		{	
+		{
 			// this folder might have associated folder conditions we need to remove now
 			$this->db->Query('DELETE FROM {pre}folder_conditions WHERE `folder`=?',
 				$folderID);
-			
+
 			// move mails to trash
 			$this->db->Query('UPDATE {pre}mails SET `folder`=?,`trashstamp`=? WHERE `folder`=? AND `userid`=?',
 				-5,
 				time(),
 				$folderID,
 				$this->userID);
-			
+
 			$this->IncMailboxStructureGeneration();
 			$this->IncMailboxGeneration();
 		}
-		
+
 		return($result);
 	}
-	
+
 	/**
 	 * Get message list.
 	 *
@@ -972,7 +1023,7 @@ class BackendB1GMail extends BackendDiff
 		ZLog::Write(LOGLEVEL_DEBUG, sprintf('b1gMail::GetMessageList(%s,%s)',
 			$folderid,
 			$cutoffdate));
-		
+
 		if($folderid == '.contacts')
 			return($this->GetContactsList($folderid, $cutoffdate));
 		else if(strlen($folderid) > 7 && substr($folderid, 0, 7) == '.tasks:')
@@ -981,10 +1032,10 @@ class BackendB1GMail extends BackendDiff
 			return($this->GetMailsList($folderid, $cutoffdate));
 		else if(strlen($folderid) > 7 && substr($folderid, 0, 7) == '.dates:')
 			return($this->GetDatesList($folderid, $cutoffdate));
-		
+
 		return(false);
 	}
-	
+
 	/**
 	 * Internally used function to retrieve a list of dates.
 	 *
@@ -997,7 +1048,7 @@ class BackendB1GMail extends BackendDiff
 		ZLog::Write(LOGLEVEL_DEBUG, sprintf('b1gMail::GetDatesList(%s,%s)',
 			$folderid,
 			$cutoffdate));
-		
+
 		list(, $dateGroupID) = explode(':', $folderid);
 		if($dateGroupID <= 0)
 			$dateGroupID = -1;
@@ -1015,10 +1066,10 @@ class BackendB1GMail extends BackendDiff
 			);
 		}
 		$res->Free();
-		
+
 		return($result);
 	}
-	
+
 	/**
 	 * Internally used function to retrieve a list of mails.
 	 *
@@ -1034,7 +1085,7 @@ class BackendB1GMail extends BackendDiff
 
 		list(, $mailFolderID) = explode(':', $folderid);
 		$result = array();
-		
+
 		$res = $this->db->Query('SELECT `id`,`fetched`,`flags` FROM {pre}mails WHERE `userid`=? AND `fetched`>=? AND `folder`=?',
 			$this->userID,
 			$cutoffdate,
@@ -1048,10 +1099,10 @@ class BackendB1GMail extends BackendDiff
 			);
 		}
 		$res->Free();
-		
+
 		return($result);
 	}
-	
+
 	/**
 	 * Internally used function to retrieve a list of tasks.
 	 *
@@ -1064,10 +1115,10 @@ class BackendB1GMail extends BackendDiff
 		ZLog::Write(LOGLEVEL_DEBUG, sprintf('b1gMail::GetTasksList(%s,%s)',
 			$folderid,
 			$cutoffdate));
-	
+
 		list(, $taskListID) = explode(':', $folderid);
 		$result = array();
-		
+
 		$res = $this->db->Query('SELECT `id`,`created`,`updated` FROM {pre}tasks'
 								. ' LEFT JOIN {pre}changelog ON {pre}changelog.`itemtype`=2 AND {pre}changelog.`itemid`={pre}tasks.`id`'
 								. ' WHERE `user`=? AND `tasklistid`=?', $this->userID, $taskListID);
@@ -1083,7 +1134,7 @@ class BackendB1GMail extends BackendDiff
 
 		return($result);
 	}
-	
+
 	/**
 	 * Internally used function to retrieve a list of contacts.
 	 *
@@ -1096,9 +1147,9 @@ class BackendB1GMail extends BackendDiff
 		ZLog::Write(LOGLEVEL_DEBUG, sprintf('b1gMail::GetContactsList(%s,%s)',
 			$folderid,
 			$cutoffdate));
-		
+
 		$result = array();
-		
+
 		$res = $this->db->Query('SELECT `id`,`created`,`updated` FROM {pre}adressen'
 								. ' LEFT JOIN {pre}changelog ON {pre}changelog.`itemtype`=0 AND {pre}changelog.`itemid`={pre}adressen.`id`'
 								. ' WHERE `user`=?', $this->userID);
@@ -1111,10 +1162,10 @@ class BackendB1GMail extends BackendDiff
 			);
 		}
 		$res->Free();
-				
+
 		return($result);
 	}
-	
+
 	/**
 	 * Get message details/contents.
 	 *
@@ -1128,7 +1179,7 @@ class BackendB1GMail extends BackendDiff
 		ZLog::Write(LOGLEVEL_DEBUG, sprintf('b1gMail::GetMessage(%s,%s)',
 			$folderid,
 			$id));
-		
+
 		if($folderid == '.contacts')
 			return($this->GetContact($folderid, $id, $contentparameters));
 		else if(strlen($folderid) > 7 && substr($folderid, 0, 7) == '.tasks:')
@@ -1137,10 +1188,10 @@ class BackendB1GMail extends BackendDiff
 			return($this->GetMail($folderid, $id, $contentparameters));
 		else if(strlen($folderid) > 7 && substr($folderid, 0, 7) == '.dates:')
 			return($this->GetDate($folderid, $id, $contentparameters));
-		
+
 		return(false);
 	}
-	
+
 	/**
 	 * Internally used function to get details of a date.
 	 *
@@ -1154,7 +1205,7 @@ class BackendB1GMail extends BackendDiff
 		ZLog::Write(LOGLEVEL_DEBUG, sprintf('b1gMail::GetDate(%s,%s)',
 			$folderid,
 			$id));
-		
+
 		// get date row
 		$res = $this->db->Query('SELECT * FROM {pre}dates WHERE `user`=? AND `id`=?',
 			$this->userID, $id);
@@ -1162,7 +1213,7 @@ class BackendB1GMail extends BackendDiff
 			return(false);
 		$row = $res->FetchArray(MYSQL_ASSOC);
 		$res->Free();
-		
+
 		// create result object
 		$result = new SyncAppointment();
 		$result->subject		= $row['title'];
@@ -1172,29 +1223,29 @@ class BackendB1GMail extends BackendDiff
 		$result->endtime		= $row['enddate'];
 		if(($row['flags'] & (2|4)) != 0)
 			$result->reminder	= (int)($row['reminder']/60);
-		
+
 		// correct start time in case of an all-day event
 		if($result->alldayevent)
 		{
 			$result->starttime	= mktime(0, 0, 0,
 				date('m', $result->starttime), date('d', $result->starttime), date('Y', $result->starttime));
 		}
-		
+
 		// text
 		$this->SetBody($result, $row['text']);
-		
+
 		// repeating?
 		if(($row['repeat_flags'] & (8|16|32|64)) != 0)
 		{
 			$rec = new SyncRecurrence();
-			
+
 			// daily
 			if(($row['repeat_flags'] & 8) != 0)
 			{
 				$rec->type 			= 0;
 				$rec->interval		= max(1, $row['repeat_value']);
 				$rec->dayofweek		= 1|2|4|8|16|32|64;
-				
+
 				// exceptions
 				if(strlen($row['repeat_extra1']) > 0)
 				{
@@ -1203,14 +1254,14 @@ class BackendB1GMail extends BackendDiff
 						$rec->dayofweek &= ~(1<<$ex);
 				}
 			}
-			
+
 			// weekly
 			else if(($row['repeat_flags'] & 16) != 0)
 			{
 				$rec->type			= 1;
 				$rec->interval		= max(1, $row['repeat_value']);
 			}
-			
+
 			// monthly mday
 			else if(($row['repeat_flags'] & 32) != 0)
 			{
@@ -1218,7 +1269,7 @@ class BackendB1GMail extends BackendDiff
 				$rec->interval		= max(1, $row['repeat_value']);
 				$rec->dayofmonth	= max(1, min(31, $row['repeat_extra1']));
 			}
-			
+
 			// monthly wday
 			else if(($row['repeat_flags'] & 64) != 0)
 			{
@@ -1226,16 +1277,16 @@ class BackendB1GMail extends BackendDiff
 				$rec->weekofmonth	= $row['repeat_extra1'] + 1;
 				$rec->dayofweek		= (1<<$row['repeat_extra2']);
 			}
-			
+
 			// repeat until
 			if(($row['repeat_flags'] & 4) != 0)			// date
 				$rec->until 		= $row['repeat_times'];
 			else if(($row['repeat_flags'] & 2) != 0)	// count
 				$rec->occurrences	= $row['repeat_times'] + 1;
-			
+
 			$result->recurrence = $rec;
 		}
-		
+
 		// get attendees
 		$result->attendees = array();
 		$res = $this->db->Query('SELECT `vorname`,`nachname`,`email`,`work_email`,`default_address` FROM {pre}adressen '
@@ -1253,17 +1304,17 @@ class BackendB1GMail extends BackendDiff
 			$result->attendees[] = $att;
 		}
 		$res->Free();
-		
+
 		// unsupported fields
 		$result->sensitivity	= 0;
 		$result->busystatus		= 2;
 		$result->meetingstatus	= 0;
 		//$result->timezone 		= false;	// TODO: Timezone data generation should be implemented.
-		$result->timezone 		= date_default_timezone_get(); 
-		
+		$result->timezone 		= date_default_timezone_get();
+
 		return($result);
 	}
-	
+
 	/**
 	 * Internally used function to get details of an email.
 	 *
@@ -1277,13 +1328,13 @@ class BackendB1GMail extends BackendDiff
 		ZLog::Write(LOGLEVEL_DEBUG, sprintf('b1gMail::GetMail(%s,%s)',
 			$folderid,
 			$id));
-		
+
 		$prioTrans = array(
 			'low'		=> 0,
 			'normal'	=> 1,
 			'high'		=> 2
 		);
-		
+
 		// get content parameters
 		$truncSize 		= Utils::GetTruncSize($contentparameters->GetTruncation());
 		$mimeSupport 	= $contentparameters->GetMimeSupport();
@@ -1294,21 +1345,21 @@ class BackendB1GMail extends BackendDiff
 			// we cannot handle RTF
 			if(in_array(SYNC_BODYPREFERENCE_RTF, $bodyPreference))
 				unset($bodyPreference[array_search(SYNC_BODYPREFERENCE_RTF, $bodyPreference)]);
-			
+
 			// still entries left in $bodyPreference array => get best match
 			if(count($bodyPreference) > 0)
 				$bodyPrefType = Utils::GetBodyPreferenceBestMatch($bodyPreference);
 		}
-		
+
 		// get mail row
-		$res = $this->db->Query('SELECT `von`,`betreff`,`flags`,`priority`,`datum`,`body` FROM {pre}mails WHERE `id`=? AND `userid`=?',
+		$res = $this->db->Query('SELECT `von`,`betreff`,`flags`,`priority`,`datum`,`blobstorage` FROM {pre}mails WHERE `id`=? AND `userid`=?',
 			$id,
 			$this->userID);
 		if($res->RowCount() != 1)
 			return(false);
 		$row = $res->FetchArray(MYSQL_ASSOC);
 		$res->Free();
-		
+
 		// create result object
 		$result = new SyncMail();
 		$result->messageclass	= 'IPM.Note';
@@ -1320,11 +1371,10 @@ class BackendB1GMail extends BackendDiff
 		$result->from			= $row['von'];
 		$result->subject 		= $row['betreff'];
 		$result->importance		= $prioTrans[$row['priority']];
-		
+
 		// get message
-		$mailData = $this->GetMessageData($id, $row['body']);
-		unset($row['body']);
-		
+		$mailData = $this->GetMessageData($id, $row['blobstorage']);
+
 		// parse message
 		$mimeParser = new Mail_mimeDecode($mailData);
 		$parsedMail = $mimeParser->decode(array(
@@ -1332,7 +1382,7 @@ class BackendB1GMail extends BackendDiff
 			'decode_bodies' => true,
 			'include_bodies' => true,
 			'charset' => 'utf-8'));
-		
+
 		// parse addresses
 		$result->to = $result->cc = $result->reply_to = array();
 		$addresses = array('to' => array(), 'cc' => array(), 'reply-to' => array());
@@ -1342,47 +1392,48 @@ class BackendB1GMail extends BackendDiff
 			$result->cc = $this->ExplodeOutsideOfQuotation($parsedMail->headers['cc'], array(',', ';'));
 		if(!empty($parsedMail->headers['reply-to']))
 			$result->reply_to = $this->ExplodeOutsideOfQuotation($parsedMail->headers['reply-to'], array(',', ';'));
-		
+
 		// assign other headers which are not available in $row
 		if(isset($parsedMail->headers['thread-topic']))
 			$result->threadtopic = $parsedMail->headers['thread-topic'];
-		
+
 		// get body...
 		if(Request::GetProtocolVersion() >= 12.0)
 		{
 			$result->asbody = new SyncBaseBody();
-			
+			$asBodyData = '';
+
 			// get body according to body preference
 			if($bodyPrefType == SYNC_BODYPREFERENCE_PLAIN)
 			{
-				$result->asbody->data = $this->GetTextFromParsedMail($parsedMail, 'plain');
+				$asBodyData = $this->GetTextFromParsedMail($parsedMail, 'plain');
 				$result->asbody->type = SYNC_BODYPREFERENCE_PLAIN;
 				$result->nativebodytype = SYNC_BODYPREFERENCE_PLAIN;
-				
-				if(empty($result->asbody->data))
+
+				if(empty($asBodyData))
 				{
-					$result->asbody->data = Utils::ConvertHtmlToText($this->GetTextFromParsedMail($parsedMail, 'html'));
+					$asBodyData = Utils::ConvertHtmlToText($this->GetTextFromParsedMail($parsedMail, 'html'));
 					if(!empty($result->asbody->data))
 						$result->nativebodytype = SYNC_BODYPREFERENCE_HTML;
 				}
 			}
 			else if($bodyPrefType == SYNC_BODYPREFERENCE_HTML)
 			{
-				$result->asbody->data = $this->GetTextFromParsedMail($parsedMail, 'html');
+				$asBodyData = $this->GetTextFromParsedMail($parsedMail, 'html');
 				$result->asbody->type = SYNC_BODYPREFERENCE_HTML;
 				$result->nativebodytype = SYNC_BODYPREFERENCE_HTML;
-				
-				if(empty($result->asbody->data))
+
+				if(empty($asBodyData))
 				{
-					$result->asbody->data = $this->GetTextFromParsedMail($parsedMail, 'plain');
-					
+					$asBodyData = $this->GetTextFromParsedMail($parsedMail, 'plain');
+
 					$result->asbody->type = SYNC_BODYPREFERENCE_PLAIN;
 					$result->nativebodytype = SYNC_BODYPREFERENCE_PLAIN;
 				}
 			}
 			else if($bodyPrefType == SYNC_BODYPREFERENCE_MIME)
 			{
-				$result->asbody->data = $mailData;
+				$asBodyData = $mailData;
 				$result->asbody->type = SYNC_BODYPREFERENCE_MIME;
 				$result->nativebodytype = SYNC_BODYPREFERENCE_MIME;
 			}
@@ -1390,57 +1441,60 @@ class BackendB1GMail extends BackendDiff
 			{
 				ZLog::Write(LOGLEVEL_ERROR, sprintf('Unknown body type: %d', $bodyPrefType));
 			}
-			
+
 			// truncate, if required
-			if(strlen($result->asbody->data) > $truncSize)
+			if(strlen($asBodyData) > $truncSize)
 			{
-				$result->asbody->data = Utils::Utf8_truncate($result->asbody->data, $truncSize);
+				$asBodyData = Utils::Utf8_truncate($asBodyData, $truncSize);
 				$result->asbody->truncated = true;
 			}
 			else
 				$result->asbody->truncated = false;
-			
-			$result->asbody->estimatedDataSize = strlen($result->asbody->data);
+
+			$result->asbody->data = StringStreamWrapper::Open($asBodyData);
+			$result->asbody->estimatedDataSize = strlen($asBodyData);
 		}
 		else
 		{
 			if($bodyPrefType == SYNC_BODYPREFERENCE_MIME)
 			{
-				$result->mimedata = $mailData;
-				
-				if(strlen($result->mimedata) > $truncSize)
+				$mimeData = $mailData;
+
+				if(strlen($mimeData) > $truncSize)
 				{
-					$result->mimedata = substr($result->mimedata, 0, $truncSize);
+					$mimeData = substr($mimeData, 0, $truncSize);
 					$result->mimetruncated = true;
 				}
 				else
 					$result->mimetruncated = false;
-				
-				$result->mimesize = strlen($result->mimedata);
+
+				$result->mimedata = StringStreamWrapper::Open($mimeData);
+				$result->mimesize = strlen($mimeData);
 			}
 			else
 			{
-				$result->body = $this->GetTextFromParsedMail($parsedMail, 'plain');
-				if(empty($result->body))
-					$result->body = Utils::ConvertHtmlToText($this->GetTextFromParsedMail($parsedMail, 'html'));
-				
-				if(strlen($result->body) > $truncSize)
+				$bodyData = $this->GetTextFromParsedMail($parsedMail, 'plain');
+				if(empty($bodyData))
+					$bodyData = Utils::ConvertHtmlToText($this->GetTextFromParsedMail($parsedMail, 'html'));
+
+				if(strlen($bodyData) > $truncSize)
 				{
-					$result->body = substr($result->body, 0, $truncSize);
+					$bodyData = substr($bodyData, 0, $truncSize);
 					$result->bodytruncated = true;
 				}
 				else
 					$result->bodytruncated = false;
-				
+
+				$result->body = StringStreamWrapper::Open($bodyData);
 				$result->bodysize = strlen($result->body);
 			}
 		}
-		
+
 		// ...and attachments
 		if($bodyPrefType != SYNC_BODYPREFERENCE_MIME)
 		{
 			$attachments = $this->GetAttachmentsFromParsedMail($parsedMail);
-			
+
 			foreach($attachments as $partID=>$part)
 			{
 				// get attachment size
@@ -1448,7 +1502,7 @@ class BackendB1GMail extends BackendDiff
 					$attSize = strlen($part->body);
 				else
 					$attSize = 0;
-				
+
 				// get attachment name
 				if(isset($part->d_parameters['filename']))
 					$attName = $part->d_parameters['filename'];
@@ -1456,17 +1510,17 @@ class BackendB1GMail extends BackendDiff
 					$attName = $part->d_parameters['name'];
 				else
 					$attName = 'Unnamed';
-				
+
 				// reference string
 				$attRef = $id . ':' . $partID;
-				
+
 				// content id
 				if(isset($part->d_parameters['content-id']))
 					$attContentID = $part->d_parameters['content-id'];
 				else
 					$attContentID = '';
 				$attContentID = trim(str_replace(array('<', '>'), '', $attContentID));
-				
+
 				if(Request::GetProtocolVersion() >= 12.0)
 				{
 					$att = new SyncBaseAttachment();
@@ -1476,7 +1530,7 @@ class BackendB1GMail extends BackendDiff
 					$att->isinline			= isset($part->disposition) && $part->disposition == 'inline';
 					$att->contentid			= $attContentID;
 					$att->method			= 1;
-					
+
 					if(empty($result->asattachments))
 						$result->asattachments = array($att);
 					else
@@ -1490,7 +1544,7 @@ class BackendB1GMail extends BackendDiff
 					$att->attname			= $attRef;
 					$att->attoid			= $attContentID;
 					$att->attmethod			= 1;
-					
+
 					if(empty($result->attachments))
 						$result->attachments = array($att);
 					else
@@ -1501,7 +1555,7 @@ class BackendB1GMail extends BackendDiff
 
 		return($result);
 	}
-	
+
 	/**
 	 * Internally used function to get details of a task.
 	 *
@@ -1515,36 +1569,36 @@ class BackendB1GMail extends BackendDiff
 		ZLog::Write(LOGLEVEL_DEBUG, sprintf('b1gMail::GetTask(%s,%s)',
 			$folderid,
 			$id));
-	
+
 		$prioTrans = array(
 			'low'		=> 0,
 			'normal'	=> 1,
 			'high'		=> 2
 		);
-	
+
 		$res = $this->db->Query('SELECT * FROM {pre}tasks WHERE `user`=? AND `id`=?',
 			$this->userID, $id);
 		if($res->RowCount() != 1)
 			return(false);
 		$row = $res->FetchArray(MYSQL_ASSOC);
 		$res->Free();
-		
+
 		$result = new SyncTask();
-		
+
 		if(!empty($row['titel']))			$result->subject			= $row['titel'];
-		
+
 		$this->SetBody($result, $row['comments']);
-		
+
 		$result->complete		= $row['akt_status'] == 64;
 		if($result->complete)	$result->datecompleted = time();
-		
+
 		$result->startdate		= $row['beginn'];
 		$result->duedate		= $row['faellig'];
 		$result->importance		= $prioTrans[$row['priority']];
-				
+
 		return($result);
 	}
-	
+
 	/**
 	 * Internally used function to get details of a contact.
 	 *
@@ -1558,26 +1612,26 @@ class BackendB1GMail extends BackendDiff
 		ZLog::Write(LOGLEVEL_DEBUG, sprintf('b1gMail::GetContact(%s,%s)',
 			$folderid,
 			$id));
-	
+
 		$res = $this->db->Query('SELECT * FROM {pre}adressen WHERE `user`=? AND `id`=?',
 			$this->userID, $id);
 		if($res->RowCount() != 1)
 			return(false);
 		$row = $res->FetchArray(MYSQL_ASSOC);
 		$res->Free();
-		
+
 		$result = new SyncContact();
-		
+
 		if(!empty($row['vorname']))			$result->firstname				= $row['vorname'];
 		if(!empty($row['nachname']))		$result->lastname				= $row['nachname'];
-		
+
 		if(!empty($row['tel']))				$result->homephonenumber		= $row['tel'];
 		if(!empty($row['fax']))				$result->homefaxnumber			= $row['fax'];
 		if(!empty($row['strassenr']))		$result->homestreet				= $row['strassenr'];
 		if(!empty($row['ort']))				$result->homecity				= $row['ort'];
 		if(!empty($row['plz']))				$result->homepostalcode			= $row['plz'];
 		if(!empty($row['land']))			$result->homecountry			= $row['land'];
-		
+
 		if(!empty($row['work_strassenr']))	$result->businessstreet			= $row['work_strassenr'];
 		if(!empty($row['work_plz']))		$result->businesspostalcode		= $row['work_plz'];
 		if(!empty($row['work_ort']))		$result->businesscity			= $row['work_ort'];
@@ -1586,7 +1640,7 @@ class BackendB1GMail extends BackendDiff
 		if(!empty($row['work_tel']))		$result->businessphonenumber	= $row['work_tel'];
 		if(!empty($row['work_fax']))		$result->businessfaxnumber		= $row['work_fax'];
 		if(!empty($row['work_handy']))		$result->business2phonenumber	= $row['work_handy'];
-		
+
 		if(!empty($row['email']))			$result->email1address			= $row['email'];
 		if(!empty($row['web']))				$result->webpage				= $row['web'];
 		if(!empty($row['handy']))			$result->mobilephonenumber		= $row['handy'];
@@ -1597,15 +1651,15 @@ class BackendB1GMail extends BackendDiff
 			if(is_array($picArray) && strlen($picArray['data'])*1.34 <= 49152)	// do not attach too big images to avoid Z-Push dropping the entire contact
 				$result->picture		= base64_encode($picArray['data']);
 		}
-		
+
 		if(!empty($row['position']))		$result->jobtitle				= $row['position'];
 		if(!empty($row['geburtsdatum']))	$result->birthday				= $row['geburtsdatum'];
-		
+
 		$this->SetBody($result, $row['kommentar']);
-		
+
 		return($result);
 	}
-	
+
 	/**
 	 * Get message stats.
 	 *
@@ -1618,7 +1672,7 @@ class BackendB1GMail extends BackendDiff
 		ZLog::Write(LOGLEVEL_DEBUG, sprintf('b1gMail::StatMessage(%s,%s)',
 			$folderid,
 			$id));
-		
+
 		if($folderid == '.contacts')
 			return($this->StatContact($folderid, $id));
 		else if(strlen($folderid) > 7 && substr($folderid, 0, 7) == '.tasks:')
@@ -1627,10 +1681,10 @@ class BackendB1GMail extends BackendDiff
 			return($this->StatMail($folderid, $id));
 		else if(strlen($folderid) > 7 && substr($folderid, 0, 7) == '.dates:')
 			return($this->StatDate($folderid, $id));
-		
+
 		return(false);
 	}
-	
+
 	/**
 	 * Internally used function to get date stats.
 	 *
@@ -1661,7 +1715,7 @@ class BackendB1GMail extends BackendDiff
 
 		return($result);
 	}
-	
+
 	/**
 	 * Internally used function to get email stats.
 	 *
@@ -1692,7 +1746,7 @@ class BackendB1GMail extends BackendDiff
 
 		return($result);
 	}
-	
+
 	/**
 	 * Internally used function to get task stats.
 	 *
@@ -1723,7 +1777,7 @@ class BackendB1GMail extends BackendDiff
 
 		return($result);
 	}
-	
+
 	/**
 	 * Internally used function to get contact stats.
 	 *
@@ -1754,7 +1808,7 @@ class BackendB1GMail extends BackendDiff
 
 		return($result);
 	}
-	
+
 	/**
 	 * Change/create a message.
 	 *
@@ -1780,7 +1834,7 @@ class BackendB1GMail extends BackendDiff
 
 		return(false);
 	}
-	
+
 	/**
 	 * Internally used function to change/create a date.
 	 *
@@ -1794,7 +1848,7 @@ class BackendB1GMail extends BackendDiff
 		ZLog::Write(LOGLEVEL_DEBUG, sprintf('b1gMail::ChangeDate(%s,%s)',
 			$folderid,
 			$id));
-		
+
 		// read existing row
 		if(!empty($id))
 		{
@@ -1807,7 +1861,7 @@ class BackendB1GMail extends BackendDiff
 		}
 		else
 			$row = array('flags' => 0);
-		
+
 		// basic data
 		$row['title']			= $date->subject;
 		$row['text']			= $this->GetBody($date);
@@ -1827,25 +1881,25 @@ class BackendB1GMail extends BackendDiff
 			$row['flags']		|= 2;	// remind by email - do not assume user wants an SMS reminder when he created the
 										// appointment on his internet-capable smartphone
 		}
-		
+
 		// initialize recurrence data
 		$row['repeat_flags']	= 0;
 		$row['repeat_times']	= 0;
 		$row['repeat_value']	= 0;
 		$row['repeat_extra1']	= '';
 		$row['repeat_extra2']	= '';
-		
+
 		// recurring?
 		if(isset($date->recurrence) && is_object($date->recurrence))
 		{
 			$rec = $date->recurrence;
-			
+
 			// daily
 			if($rec->type == 0 || ($rec->type == 1 && $rec->interval == 1 && isset($rec->dayofweek)))
 			{
 				$row['repeat_flags']	|= 8;
 				$row['repeat_value']	= max(1, $rec->interval);
-				
+
 				// convert dayofweek bitmask to b1gMail exception array
 				if(!empty($rec->dayofweek))
 				{
@@ -1856,17 +1910,17 @@ class BackendB1GMail extends BackendDiff
 							$exceptions[] = $i;
 					}
 				}
-				
+
 				$row['repeat_extra1']	= implode(',', $exceptions);
 			}
-			
+
 			// weekly
 			else if($rec->type == 1)
 			{
 				$row['repeat_flags']	|= 16;
 				$row['repeat_value']	= max(1, $rec->interval);
 			}
-			
+
 			// monthly mday
 			else if($rec->type == 3)
 			{
@@ -1874,7 +1928,7 @@ class BackendB1GMail extends BackendDiff
 				$row['repeat_value']	= max(1, $rec->interval);
 				$row['repeat_extra1']	= max(1, min(31, $rec->dayofmonth));
 			}
-			
+
 			// monthly wday
 			else if($rec->type == 2)
 			{
@@ -1882,14 +1936,14 @@ class BackendB1GMail extends BackendDiff
 				$row['repeat_extra1']	= max(0, min(4, $rec->weekofmonth - 1));
 				$row['repeat_extra2']	= max(0, min(6, (int)log($rec->dayofweek, 2)));
 			}
-			
+
 			// repeat until date...
 			if(isset($rec->until) && $rec->until > 0)
 			{
 				$row['repeat_flags']	|= 4;
 				$row['repeat_times']	= $rec->until;
 			}
-			
+
 			// ...or n times
 			else if(isset($rec->occurences) && $rec->occurences > 0)
 			{
@@ -1897,14 +1951,14 @@ class BackendB1GMail extends BackendDiff
 				$row['repeat_times']	= $rec->occurences + 1;
 			}
 		}
-		
+
 		// create new item
 		if(empty($id))
 		{
 			list(, $groupID) = explode(':', $folderid);
 			if($groupID <= 0)
 				$groupID = -1;
-			
+
 			$this->db->Query('INSERT INTO {pre}dates(`user`,`title`,`location`,`text`,`group`,`startdate`,`enddate`,`reminder`,`flags`, '
 							. '`repeat_flags`,`repeat_times`,`repeat_value`,`repeat_extra1`,`repeat_extra2`) '
 							. 'VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
@@ -1923,10 +1977,10 @@ class BackendB1GMail extends BackendDiff
 				$row['repeat_extra1'],
 				$row['repeat_extra2']);
 			$id = $this->db->InsertId();
-			
+
 			$this->ChangelogAdded(1, $id, time());
 		}
-		
+
 		// change existing item
 		else
 		{
@@ -1947,10 +2001,10 @@ class BackendB1GMail extends BackendDiff
 				$row['repeat_extra2'],
 				$id,
 				$this->userID);
-			
+
 			$this->ChangelogUpdated(1, $id, time());
 		}
-		
+
 		// determine attendee IDs
 		$attIDs = array();
 		if(isset($date->attendees) && is_array($date->attendees))
@@ -1959,26 +2013,26 @@ class BackendB1GMail extends BackendDiff
 			{
 				if(!is_object($att))
 					continue;
-				
+
 				$res = $this->db->Query('SELECT `id` FROM {pre}adressen WHERE (`email`=? OR `work_email`=?) AND `user`=? LIMIT 1',
 					$att->email, $att->email, $this->userID);
 				if($res->RowCount() != 1)
 					continue;
 				$attRow = $res->FetchArray(MYSQL_ASSOC);
 				$res->Free();
-				
+
 				$attIDs[] = $attRow['id'];
 			}
 		}
-		
+
 		// update attendees
 		$this->db->Query('DELETE FROM {pre}dates_attendees WHERE `date`=?', $id);
 		foreach($attIDs as $attID)
 			$this->db->Query('INSERT INTO {pre}dates_attendees(`date`,`address`) VALUES(?,?)', $id, $attID);
-		
+
 		return($this->StatMessage($folderid, $id));
 	}
-	
+
 	/**
 	 * Internally used function to change/create a contact.
 	 *
@@ -1992,7 +2046,7 @@ class BackendB1GMail extends BackendDiff
 		ZLog::Write(LOGLEVEL_DEBUG, sprintf('b1gMail::ChangeContact(%s,%s)',
 			$folderid,
 			$id));
-		
+
 		// prepare pic data
 		$picData = '';
 		if(!empty($contact->picture))
@@ -2003,7 +2057,7 @@ class BackendB1GMail extends BackendDiff
 				'mimeType'	=> $this->GuessPictureType(substr($picRaw, 0, 4))
 			));
 		}
-		
+
 		// create new item
 		if(empty($id))
 		{
@@ -2037,10 +2091,10 @@ class BackendB1GMail extends BackendDiff
 				$picData,
 				$this->GetBody($contact));
 			$id = $this->db->InsertId();
-			
+
 			$this->ChangelogAdded(0, $id, time());
 		}
-		
+
 		// update existing item
 		else
 		{
@@ -2074,13 +2128,13 @@ class BackendB1GMail extends BackendDiff
 				$this->GetBody($contact),
 				$id,
 				$this->userID);
-			
+
 			$this->ChangelogUpdated(0, $id, time());
 		}
-		
+
 		return($this->StatMessage($folderid, $id));
 	}
-	
+
 	/**
 	 * Internally used function to change/create a task.
 	 *
@@ -2094,14 +2148,14 @@ class BackendB1GMail extends BackendDiff
 		ZLog::Write(LOGLEVEL_DEBUG, sprintf('b1gMail::ChangeTask(%s,%s)',
 			$folderid,
 			$id));
-		
+
 		list(, $taskListID) = explode(':', $folderid);
 		$prioTrans = array(
 			0	=> 'low',
 			1	=> 'normal',
 			2	=> 'high'
 		);
-		
+
 		// create new item
 		if(empty($id))
 		{
@@ -2116,10 +2170,10 @@ class BackendB1GMail extends BackendDiff
 				$task->subject,
 				$this->GetBody($task));
 			$id = $this->db->InsertId();
-			
+
 			$this->ChangelogAdded(2, $id, time());
 		}
-		
+
 		// update existing item
 		else
 		{
@@ -2129,19 +2183,19 @@ class BackendB1GMail extends BackendDiff
 				return(false);
 			$row = $res->FetchArray(MYSQL_ASSOC);
 			$res->Free();
-		
+
 			if($task->complete)
 				$row['akt_status'] = 64;
 			else if($row['akt_status'] == 64)
 				$row['akt_status'] = 16;
-		
+
 			if($task->startdate > 0)	$row['beginn'] 		= $task->startdate;
 			if($task->duedate > 0)		$row['faellig'] 	= $task->duedate;
-		
+
 			$row['priority'] 	= $prioTrans[$task->importance];
 			$row['titel']		= $task->subject;
 			$row['comments']	= $this->GetBody($task);
-		
+
 			$this->db->Query('UPDATE {pre}tasks SET `akt_status`=?,`beginn`=?,`faellig`=?,`priority`=?,`titel`=?,`comments`=? WHERE `id`=? AND `user`=?',
 				$row['akt_status'],
 				$row['beginn'],
@@ -2151,13 +2205,13 @@ class BackendB1GMail extends BackendDiff
 				$row['comments'],
 				$id,
 				$this->userID);
-		
+
 			$this->ChangelogUpdated(2, $id, time());
 		}
 
 		return($this->StatMessage($folderid, $id));
 	}
-	
+
 	/**
 	 * Set message read flag.
 	 *
@@ -2174,10 +2228,10 @@ class BackendB1GMail extends BackendDiff
 			$flags));
 
 		// TODO: figure out the role of $contentParameters and implement functionality, if needed
-		
+
 		if(strlen($folderid) <= 7 || substr($folderid, 0, 7) != '.email:')
 			return(false);
-		
+
 		// get current mail flags
 		$res = $this->db->Query('SELECT `flags` FROM {pre}mails WHERE `id`=? AND `userid`=?',
 			$id,
@@ -2186,26 +2240,26 @@ class BackendB1GMail extends BackendDiff
 			return(false);
 		list($mailFlags) = $res->FetchArray(MYSQL_NUM);
 		$res->Free();
-		
+
 		// mark as unread (add b1gMail's unread flag)
 		if($flags == 0)
 			$mailFlags |= 1;
-		
+
 		// mark as read (remove b1gMail's unread flag)
 		else if($flags == 1)
 			$mailFlags &= ~1;
-		
+
 		// set new flags
 		$this->db->Query('UPDATE {pre}mails SET `flags`=? WHERE `id`=? AND `userid`=?',
 			$mailFlags,
 			$id,
 			$this->userID);
-		
+
 		$this->IncMailboxGeneration();
-		
+
 		return(true);
 	}
-	
+
 	/**
 	 * Delete a message.
 	 *
@@ -2232,7 +2286,7 @@ class BackendB1GMail extends BackendDiff
 
 		return(false);
 	}
-	
+
 	/**
 	 * Internally used function to delete an email.
 	 *
@@ -2245,20 +2299,18 @@ class BackendB1GMail extends BackendDiff
 		ZLog::Write(LOGLEVEL_DEBUG, sprintf('b1gMail::DeleteMail(%s,%s)',
 			$folderid,
 			$id));
-		
+
 		$result = false;
-		
-		$res = $this->db->Query('SELECT `body`,`size` FROM {pre}mails WHERE `id`=? AND `userid`=?',
+
+		$res = $this->db->Query('SELECT `blobstorage`,`size` FROM {pre}mails WHERE `id`=? AND `userid`=?',
 			$id,
 			$this->userID);
 		while($row = $res->FetchArray(MYSQL_ASSOC))
 		{
-			if($row['body'] == 'file')
-			{
-				$msgFilename = $this->DataFilename($id);
-				@unlink($msgFilename);
-			}
-			
+			$provider = $this->CreateBlobStorageProvider($row['blobstorage']);
+			if($provider)
+				$provider->deleteBlob(BMBLOB_TYPE_MAIL, $id);
+
 			$this->db->Query('DELETE FROM {pre}certmails WHERE `mail`=? AND `user`=?',
 				$id,
 				$this->userID);
@@ -2269,16 +2321,16 @@ class BackendB1GMail extends BackendDiff
 			$this->db->Query('UPDATE {pre}users SET `mailspace_used`=GREATEST(0,`mailspace_used`-?) WHERE `id`=?',
 				$row['size'],
 				$this->userID);
-			
+
 			$this->IncMailboxGeneration();
-			
+
 			$result = true;
 		}
 		$res->Free();
-		
+
 		return($result);
 	}
-	
+
 	/**
 	 * Internally used function to delete a date.
 	 *
@@ -2291,7 +2343,7 @@ class BackendB1GMail extends BackendDiff
 		ZLog::Write(LOGLEVEL_DEBUG, sprintf('b1gMail::DeleteDate(%s,%s)',
 			$folderid,
 			$id));
-		
+
 		$this->db->Query('DELETE FROM {pre}dates WHERE `id`=? AND `user`=?',
 			$id,
 			$this->userID);
@@ -2303,7 +2355,7 @@ class BackendB1GMail extends BackendDiff
 		}
 		return(true);
 	}
-	
+
 	/**
 	 * Internally used function to delete a contact.
 	 *
@@ -2316,7 +2368,7 @@ class BackendB1GMail extends BackendDiff
 		ZLog::Write(LOGLEVEL_DEBUG, sprintf('b1gMail::DeleteContact(%s,%s)',
 			$folderid,
 			$id));
-		
+
 		$this->db->Query('DELETE FROM {pre}adressen WHERE `id`=? AND `user`=?',
 			$id,
 			$this->userID);
@@ -2328,7 +2380,7 @@ class BackendB1GMail extends BackendDiff
 		}
 		return(true);
 	}
-	
+
 	/**
 	 * Internally used function to delete a task.
 	 *
@@ -2341,7 +2393,7 @@ class BackendB1GMail extends BackendDiff
 		ZLog::Write(LOGLEVEL_DEBUG, sprintf('b1gMail::DeleteTask(%s,%s)',
 			$folderid,
 			$id));
-		
+
 		$this->db->Query('DELETE FROM {pre}tasks WHERE `id`=? AND `user`=?',
 			$id,
 			$this->userID);
@@ -2351,7 +2403,7 @@ class BackendB1GMail extends BackendDiff
 		}
 		return(true);
 	}
-	
+
 	/**
 	 * Move a message to another folder.
 	 *
@@ -2366,7 +2418,7 @@ class BackendB1GMail extends BackendDiff
 			$folderid,
 			$id,
 			$newfolderid));
-		
+
 		// TODO: figure out the role of $contentParameters and implement functionality, if needed
 
 		if($folderid == '.contacts')
@@ -2380,7 +2432,7 @@ class BackendB1GMail extends BackendDiff
 
 		return(false);
 	}
-	
+
 	/**
 	 * Internally used function to move a date to another folder.
 	 *
@@ -2395,7 +2447,7 @@ class BackendB1GMail extends BackendDiff
 			$folderid,
 			$id,
 			$newfolderid));
-		
+
 		if(strlen($newfolderid) <= 7 || substr($newfolderid, 0, 7) != '.dates:')
 			return(false);
 
@@ -2408,10 +2460,10 @@ class BackendB1GMail extends BackendDiff
 			$id,
 			$this->userID);
 		$this->ChangelogUpdated(1, $id, time());
-		
+
 		return((string)$id);
 	}
-	
+
 	/**
 	 * Internally used function to move an email to another folder.
 	 *
@@ -2426,17 +2478,17 @@ class BackendB1GMail extends BackendDiff
 			$folderid,
 			$id,
 			$newfolderid));
-		
+
 		if(strlen($newfolderid) <= 7 || substr($newfolderid, 0, 7) != '.email:')
 			return(false);
-		
+
 		list(, $newFolderID) = explode(':', $newfolderid);
-		
+
 		$this->db->Query('UPDATE {pre}mails SET `folder`=? WHERE `id`=? AND `userid`=?',
 			$newFolderID,
 			$id,
 			$this->userID);
-		
+
 		// update trash timestamp if message has been moved to trash
 		if($newFolderID == -5)
 		{
@@ -2445,12 +2497,12 @@ class BackendB1GMail extends BackendDiff
 				$id,
 				$this->userID);
 		}
-		
+
 		$this->IncMailboxGeneration();
-		
+
 		return((string)$id);
 	}
-	
+
 	/**
 	 * Internally used function to move a task to another folder.
 	 *
@@ -2465,21 +2517,21 @@ class BackendB1GMail extends BackendDiff
 			$folderid,
 			$id,
 			$newfolderid));
-		
+
 		if(strlen($newfolderid) <= 7 || substr($newfolderid, 0, 7) != '.tasks:')
 			return(false);
-		
+
 		list(, $newTaskListID) = explode(':', $newfolderid);
-		
+
 		$this->db->Query('UPDATE {pre}tasks SET `tasklistid`=? WHERE `id`=? AND `user`=?',
 			$newTaskListID,
 			$id,
 			$this->userID);
 		$this->ChangelogUpdated(2, $id, time());
-		
+
 		return((string)$id);
 	}
-	
+
 	/**
 	 * Returns AS version supported by this backend.
 	 *
@@ -2489,16 +2541,16 @@ class BackendB1GMail extends BackendDiff
 	{
 		return ZPush::ASV_14;
 	}
-	
+
 	//
 	// internally used functions
 	//
-	
-	
+
+
 	//
 	// internally used utility functions
 	//
-	
+
 	/**
 	 * Create a b1gMail 'last updated' changelog entry.
 	 *
@@ -2524,7 +2576,7 @@ class BackendB1GMail extends BackendDiff
 				$updated, $itemType, $itemID);
 		}
 	}
-	
+
 	/**
 	 * Create a b1gMail 'added' changelog entry.
 	 *
@@ -2550,7 +2602,7 @@ class BackendB1GMail extends BackendDiff
 				$added, $itemType, $itemID);
 		}
 	}
-	
+
 	/**
 	 * Create a b1gMail 'deleted' changelog entry.
 	 *
@@ -2576,7 +2628,7 @@ class BackendB1GMail extends BackendDiff
 				$deleted, $itemType, $itemID);
 		}
 	}
-	
+
 	/**
 	 * Guess MIME type of a picture by picture file signature.
 	 *
@@ -2594,7 +2646,7 @@ class BackendB1GMail extends BackendDiff
 		else
 			return('image/unknown');
 	}
-	
+
 	/**
 	 * Get file name of data item.
 	 *
@@ -2602,7 +2654,7 @@ class BackendB1GMail extends BackendDiff
 	 * @param string $ext Extension
 	 * @return string
 	 */
-	private function DataFilename($id, $ext = 'msg')
+	public function DataFilename($id, $ext = 'msg')
 	{
 		$dir = $this->prefs['datafolder'];
 
@@ -2629,10 +2681,10 @@ class BackendB1GMail extends BackendDiff
 
 		if(file_exists($dir) || $this->prefs['structstorage'] == 'yes')
 			return($dir);
-		else 
+		else
 			return($this->prefs['datafolder'] . $id . '.' . $ext);
 	}
-	
+
 	/**
 	 * Get b1gMail preferences.
 	 *
@@ -2643,10 +2695,10 @@ class BackendB1GMail extends BackendDiff
 		$res = $this->db->Query('SELECT * FROM {pre}prefs LIMIT 1');
 		$prefs = $res->FetchArray(MYSQL_ASSOC);
 		$res->Free();
-		
+
 		return($prefs);
 	}
-	
+
 	/**
 	 * split string by $separator, taking care of "quotations"
 	 *
@@ -2696,7 +2748,7 @@ class BackendB1GMail extends BackendDiff
 
 		return($result);
 	}
-	
+
 	/**
 	 * Extract text from parsed mail.
 	 *
@@ -2705,26 +2757,26 @@ class BackendB1GMail extends BackendDiff
 	 * @return string
 	 */
 	private function GetTextFromParsedMail($parsedMail, $type)
-	{		
+	{
 		$result = '';
 		$objs = array($parsedMail);
-		
+
 		while(count($objs) > 0)
 		{
 			$obj = array_shift($objs);
-			
+
 			if(!isset($obj->ctype_primary))
 				continue;
-			
+
 			if(strtolower($obj->ctype_primary) == 'text' && strtolower($obj->ctype_secondary) == strtolower($type))
 				$result .= $obj->body;
 			else if(strtolower($obj->ctype_primary) == 'multipart' && !empty($obj->parts))
 				$objs = array_merge($objs, $obj->parts);
 		}
-		
+
 		return($result);
 	}
-	
+
 	/**
 	 * Get attachment parts from mail.
 	 *
@@ -2737,34 +2789,34 @@ class BackendB1GMail extends BackendDiff
 
 		if(!isset($parsedMail->parts))
 			return($result);
-		
+
 		$objs = $parsedMail->parts;
-		
+
 		while(is_array($objs) && count($objs) > 0)
 		{
 			$part = array_shift($objs);
-			
+
 			if(!isset($part->ctype_primary))
 				continue;
-			
+
 			// also process sub-parts
 			if(strtolower($part->ctype_primary) == 'multipart' && in_array(strtolower($part->ctype_secondary), array('alternative', 'mixed', 'related')))
 			{
 				$objs = array_merge($objs, $part->parts);
 				continue;
 			}
-			
+
 			// do not consider text parts as attachment
 			if(strtolower($part->ctype_primary) == 'text')
 				continue;
-			
+
 			// if content disposition is set, only proceed if it is set to attachment or inline
 			if(!empty($part->disposition) && !in_array($part->disposition, array('attachment', 'inline')))
 				continue;
-			
+
 			$result[] = $part;
 		}
-		
+
 		return($result);
 	}
 
@@ -2778,7 +2830,7 @@ class BackendB1GMail extends BackendDiff
 	{
 		if($bytes == 0)
 			return(true);
-		
+
 		if($bytes < 0)
 		{
 			$this->db->Query('UPDATE {pre}users SET `mailspace_used`=GREATEST(0,`mailspace_used`-' . abs($bytes) . ') WHERE `id`=?',
@@ -2791,7 +2843,7 @@ class BackendB1GMail extends BackendDiff
 				$this->userID);
 			$this->userRow['mailspace_used'] += abs($bytes);
 		}
-		
+
 		return(true);
 	}
 
@@ -2803,7 +2855,7 @@ class BackendB1GMail extends BackendDiff
 		$this->db->Query('UPDATE {pre}users SET `mailbox_generation`=`mailbox_generation`+1 WHERE `id`=?',
 			$this->userID);
 	}
-	
+
 	/**
 	 * Increment the acocunt's mailbox structure generation
 	 */
@@ -2812,7 +2864,7 @@ class BackendB1GMail extends BackendDiff
 		$this->db->Query('UPDATE {pre}users SET `mailbox_structure_generation`=`mailbox_structure_generation`+1 WHERE `id`=?',
 			$this->userID);
 	}
-	
+
 	/**
 	 * Set body of a sync object.
 	 *
@@ -2836,7 +2888,7 @@ class BackendB1GMail extends BackendDiff
 			$result->bodysize					= strlen($result->body);
 		}
 	}
-	
+
 	/**
 	 * Get body of a sync object.
 	 *
@@ -2856,7 +2908,7 @@ class BackendB1GMail extends BackendDiff
 		{
 			return($obj->body);
 		}
-		
+
 		return('');
 	}
 
@@ -2909,7 +2961,7 @@ class BackendB1GMail extends BackendDiff
 
 	/**
 	 * get user's possible sender email addresses
-	 * 
+	 *
 	 * @return array
 	 */
 	private function GetPossibleSenders()
@@ -3025,18 +3077,59 @@ class BackendB1GMail extends BackendDiff
 	}
 
 	/**
+	 * create instance of blob storage provider
+	 *
+	 * @param int $id Provider ID
+	 * @return BMBlobStorage object
+	 */
+	function CreateBlobStorageProvider($id)
+	{
+		$result = false;
+
+		switch($id)
+		{
+		case BMBLOBSTORAGE_SEPARATEFILES:
+			$result = new BMBlobStorage_SeparateFiles;
+			break;
+		case BMBLOBSTORAGE_USERDB:
+			$result = new BMBlobStorage_UserDB;
+			break;
+		default:
+			ZLog::Write(LOGLEVEL_ERROR, sprintf('Unsupported blob storage backend: %d', $id));
+			break;
+		}
+
+		if($result === false)
+			return false;
+
+		$result->setBackendInstance($this);
+		$result->open($this->userID);
+
+		return $result;
+	}
+
+	/**
 	 * get message data
 	 *
 	 * @param int $id Mail ID
-	 * @param string $body body column from mail row
+	 * @param int $blobStorage Blob storage provider ID
 	 * @return string
 	 */
-	function GetMessageData($id, $body)
+	function GetMessageData($id, $blobStorage)
 	{
-		if($body == 'file')
-			$mailData = @file_get_contents($this->DataFilename($id));
-		else
-			$mailData = $body;
+		$provider = $this->CreateBlobStorageProvider($blobStorage);
+
+		$fp = $provider->loadBlob(BMBLOB_TYPE_MAIL, $id);
+		if(!$fp)
+		{
+			ZLog::Write(LOGLEVEL_ERROR, sprintf('Failed to load blob %d using provider %d', $id, $blobStorage));
+			return '';
+		}
+
+		$mailData = '';
+		while(!feof($fp))
+			$mailData .= fread($fp, 4096);
+		fclose($fp);
 
 		// tccme handling
 		if($this->tccmeInstalled)
@@ -3065,7 +3158,7 @@ class BackendB1GMail extends BackendDiff
 						ZLog::Write(LOGLEVEL_ERROR, sprintf('b1gMail::GetMessageData(%d): Failed to decrypt message', $id));
 					}
 				}
-				else 
+				else
 				{
 					ZLog::Write(LOGLEVEL_ERROR, sprintf('b1gMail::GetMessageData(%d): Failed to create temp file: %s',
 						$id,
