@@ -791,6 +791,24 @@ class BackendB1GMail extends BackendDiff
 		return(false);
 	}
 
+	/** Internally function used to get the email adress in correct format on android phones
+	 * @param string $rfc_email_string Email-String
+	 * return string email
+	 */
+
+	private function get_email_from_rfc_email($rfc_email_string) {
+    		// extract parts between the two parentheses
+    		$mailAddress = preg_match('/(?:<)(.+)(?:>)$/', $rfc_email_string, $matches);
+		if (filter_var($matches[1], FILTER_VALIDATE_EMAIL)) {
+  			return $matches[1];
+		} else if (filter_var($rfc_email_string, FILTER_VALIDATE_EMAIL)) {
+  			return $rfc_email_string;
+		}
+		else {
+			return "";
+		}
+	}
+
 	/**
 	 * Internally used function to create/rename a task list.
 	 *
@@ -2078,11 +2096,11 @@ class BackendB1GMail extends BackendDiff
 				$contact->businesspostalcode,
 				$contact->businesscity,
 				$contact->businesscountry,
-				$contact->email2address,
+				$this->get_email_from_rfc_email($contact->email2address),
 				$contact->businessphonenumber,
 				$contact->businessfaxnumber,
 				$contact->business2phonenumber,
-				$contact->email1address,
+				$this->get_email_from_rfc_email($contact->email1address),
 				$contact->webpage,
 				$contact->mobilephonenumber,
 				$contact->companyname,
@@ -2114,11 +2132,11 @@ class BackendB1GMail extends BackendDiff
 				$contact->businesspostalcode,
 				$contact->businesscity,
 				$contact->businesscountry,
-				$contact->email2address,
+				$this->get_email_from_rfc_email($contact->email2address),
 				$contact->businessphonenumber,
 				$contact->businessfaxnumber,
 				$contact->business2phonenumber,
-				$contact->email1address,
+				$this->get_email_from_rfc_email($contact->email1address),
 				$contact->webpage,
 				$contact->mobilephonenumber,
 				$contact->companyname,
